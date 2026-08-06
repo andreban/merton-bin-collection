@@ -3,7 +3,6 @@
 use std::time::Duration;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::Client;
-use tokio::time::sleep;
 
 use crate::error::MertonError;
 use crate::models::{AddressSearchResult, PropertyBinSchedule};
@@ -153,10 +152,53 @@ impl MertonClient {
                 return parse_bin_schedule(&property_id, &body);
             }
 
-            sleep(self.poll_interval).await;
+            async_sleep(self.poll_interval).await;
         }
 
         Err(MertonError::Timeout(property_id))
+    }
+}
+
+/// Helper function to sleep asynchronously without depending on a specific async runtime.
+fn async_sleep(duration: Duration) -> impl std::future::Future<Output = ()> {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    struct SleepFuture {
+        done: Arc<AtomicBool>,
+        started: bool,
+        duration: Duration,
+    }
+
+    impl Future for SleepFuture {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.done.load(Ordering::Relaxed) {
+                return Poll::Ready(());
+            }
+            if !self.started {
+                self.started = true;
+                let done = self.done.clone();
+                let waker = cx.waker().clone();
+                let duration = self.duration;
+                std::thread::spawn(move || {
+                    std::thread::sleep(duration);
+                    done.store(true, Ordering::Relaxed);
+                    waker.wake();
+                });
+            }
+            Poll::Pending
+        }
+    }
+
+    SleepFuture {
+        done: Arc::new(AtomicBool::new(false)),
+        started: false,
+        duration,
     }
 }
 
