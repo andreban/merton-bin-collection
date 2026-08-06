@@ -1,0 +1,13 @@
+[package]
+name = "merton-bin-collection"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json", "cookies"] }
+tokio = { version = "1", features = ["full"] }
+scraper = "0.22"
+serde = { version = "1.0", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2.0"
