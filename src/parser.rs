@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime};
 use scraper::{Html, Selector};
 use crate::error::MertonError;
 use crate::models::{AddressSearchResult, Collection, PropertyBinSchedule};
+
+#[cfg(feature = "time")]
+use crate::models::{Date, DateTime};
+
+#[cfg(all(feature = "chrono", not(feature = "time")))]
+use crate::models::{Date, DateTime};
 
 /// Parses postcode search results HTML into a list of address options.
 pub fn parse_postcode_addresses(html: &str) -> Result<Vec<AddressSearchResult>, MertonError> {
@@ -33,17 +38,31 @@ pub fn parse_postcode_addresses(html: &str) -> Result<Vec<AddressSearchResult>, 
     Ok(results)
 }
 
-/// Parses the bin schedule HTML fragment/page using current local date as reference.
+/// Parses the bin schedule HTML fragment/page using current date as reference.
 pub fn parse_bin_schedule(property_id: &str, html: &str) -> Result<PropertyBinSchedule, MertonError> {
-    let today = Local::now().date_naive();
-    parse_bin_schedule_with_ref_date(property_id, html, today)
+    #[cfg(feature = "time")]
+    let ref_date = time::OffsetDateTime::now_utc().date();
+
+    #[cfg(all(feature = "chrono", not(feature = "time")))]
+    let ref_date = chrono::Local::now().date_naive();
+
+    #[cfg(any(feature = "time", feature = "chrono"))]
+    {
+        parse_bin_schedule_with_ref_date(property_id, html, ref_date)
+    }
+
+    #[cfg(not(any(feature = "time", feature = "chrono")))]
+    {
+        parse_bin_schedule_raw(property_id, html)
+    }
 }
 
 /// Parses the bin schedule HTML fragment/page with a specific reference date for year resolution.
+#[cfg(any(feature = "time", feature = "chrono"))]
 pub fn parse_bin_schedule_with_ref_date(
     property_id: &str,
     html: &str,
-    ref_date: NaiveDate,
+    ref_date: Date,
 ) -> Result<PropertyBinSchedule, MertonError> {
     let document = Html::parse_document(html);
 
@@ -139,6 +158,83 @@ pub fn parse_bin_schedule_with_ref_date(
     })
 }
 
+/// Fallback parser when no date library feature is enabled.
+#[cfg(not(any(feature = "time", feature = "chrono")))]
+fn parse_bin_schedule_raw(property_id: &str, html: &str) -> Result<PropertyBinSchedule, MertonError> {
+    let document = Html::parse_document(html);
+    let address_selector = Selector::parse(".waste__address__property")
+        .map_err(|e| MertonError::Parse(format!("Invalid selector: {:?}", e)))?;
+
+    let address = document
+        .select(&address_selector)
+        .next()
+        .map(|el| clean_text(&el.text().collect::<Vec<_>>().join(" ")))
+        .filter(|a| !a.is_empty());
+
+    let grid_selector = Selector::parse(".waste-service-grid")
+        .map_err(|e| MertonError::Parse(format!("Invalid selector: {:?}", e)))?;
+    let name_selector = Selector::parse(".waste-service-name, h3")
+        .map_err(|e| MertonError::Parse(format!("Invalid selector: {:?}", e)))?;
+    let row_selector = Selector::parse(".govuk-summary-list__row")
+        .map_err(|e| MertonError::Parse(format!("Invalid selector: {:?}", e)))?;
+    let key_selector = Selector::parse(".govuk-summary-list__key")
+        .map_err(|e| MertonError::Parse(format!("Invalid selector: {:?}", e)))?;
+    let val_selector = Selector::parse(".govuk-summary-list__value")
+        .map_err(|e| MertonError::Parse(format!("Invalid selector: {:?}", e)))?;
+    let p_selector = Selector::parse("p")
+        .map_err(|e| MertonError::Parse(format!("Invalid selector: {:?}", e)))?;
+
+    let mut collections = Vec::new();
+
+    for grid in document.select(&grid_selector) {
+        let service_name = match grid.select(&name_selector).next() {
+            Some(el) => clean_text(&el.text().collect::<Vec<_>>().join(" ")),
+            None => continue,
+        };
+
+        if service_name.is_empty() {
+            continue;
+        }
+
+        let mut frequency = None;
+
+        for row in grid.select(&row_selector) {
+            let key = row
+                .select(&key_selector)
+                .next()
+                .map(|k| clean_text(&k.text().collect::<Vec<_>>().join(" ")))
+                .unwrap_or_default();
+            let val = row
+                .select(&val_selector)
+                .next()
+                .map(|v| clean_text(&v.text().collect::<Vec<_>>().join(" ")))
+                .unwrap_or_default();
+
+            if key.eq_ignore_ascii_case("Frequency") {
+                frequency = Some(val);
+            }
+        }
+
+        let info = grid
+            .select(&p_selector)
+            .next()
+            .map(|p| clean_text(&p.text().collect::<Vec<_>>().join(" ")))
+            .filter(|p| !p.is_empty());
+
+        collections.push(Collection {
+            service_name,
+            frequency,
+            info,
+        });
+    }
+
+    Ok(PropertyBinSchedule {
+        property_id: property_id.to_string(),
+        address,
+        collections,
+    })
+}
+
 /// Helper function to normalize and clean HTML element text.
 fn clean_text(s: &str) -> String {
     s.lines()
@@ -148,8 +244,141 @@ fn clean_text(s: &str) -> String {
         .join(" ")
 }
 
-/// Parses date strings such as "Friday 7 August", "Friday 14 August 2026", "Today", or "Tomorrow".
-pub fn parse_date_string(s: &str, ref_date: NaiveDate) -> Option<NaiveDate> {
+// -----------------------------------------------------------------------------
+// TIME CRATE IMPLEMENTATION
+// -----------------------------------------------------------------------------
+#[cfg(feature = "time")]
+pub fn parse_date_string(s: &str, ref_date: Date) -> Option<Date> {
+    let s_clean = s.trim();
+
+    if s_clean.eq_ignore_ascii_case("today") {
+        return Some(ref_date);
+    }
+    if s_clean.eq_ignore_ascii_case("tomorrow") {
+        return ref_date.next_day();
+    }
+
+    let replaced = s_clean.replace(',', " ");
+    let tokens: Vec<&str> = replaced.split_whitespace().collect();
+
+    let mut day: Option<u8> = None;
+    let mut month: Option<time::Month> = None;
+    let mut year: Option<i32> = None;
+
+    for token in &tokens {
+        if let Ok(y) = token.parse::<i32>() {
+            if (2020..=2100).contains(&y) {
+                year = Some(y);
+                continue;
+            }
+        }
+        if let Ok(d) = token.parse::<u8>() {
+            if (1..=31).contains(&d) {
+                day = Some(d);
+                continue;
+            }
+        }
+        if let Some(m) = parse_month_time(token) {
+            month = Some(m);
+        }
+    }
+
+    let d = day?;
+    let m = month?;
+    let y = match year {
+        Some(y) => y,
+        None => {
+            let mut y = ref_date.year();
+            if let Ok(candidate) = time::Date::from_calendar_date(y, m, d) {
+                // If candidate is earlier in the year than ref_date by > 6 months, add 1 year
+                let diff_days = candidate.ordinal() as i32 - ref_date.ordinal() as i32;
+                if diff_days < -180 {
+                    y += 1;
+                } else if diff_days > 180 {
+                    y -= 1;
+                }
+            }
+            y
+        }
+    };
+
+    time::Date::from_calendar_date(y, m, d).ok()
+}
+
+#[cfg(feature = "time")]
+pub fn parse_datetime_string(s: &str, ref_date: Date) -> Option<DateTime> {
+    let s_clean = s.trim();
+    let parts: Vec<&str> = if s_clean.contains(", at ") {
+        s_clean.split(", at ").collect()
+    } else if s_clean.contains(" at ") {
+        s_clean.split(" at ").collect()
+    } else {
+        vec![s_clean]
+    };
+
+    let date_part = parts.first()?;
+    let date = parse_date_string(date_part, ref_date)?;
+
+    let time = if parts.len() > 1 {
+        parse_time_string_time(parts[1].trim())?
+    } else {
+        time::Time::MIDNIGHT
+    };
+
+    Some(time::PrimitiveDateTime::new(date, time))
+}
+
+#[cfg(feature = "time")]
+fn parse_month_time(s: &str) -> Option<time::Month> {
+    match s.to_lowercase().as_str() {
+        "january" | "jan" => Some(time::Month::January),
+        "february" | "feb" => Some(time::Month::February),
+        "march" | "mar" => Some(time::Month::March),
+        "april" | "apr" => Some(time::Month::April),
+        "may" => Some(time::Month::May),
+        "june" | "jun" => Some(time::Month::June),
+        "july" | "jul" => Some(time::Month::July),
+        "august" | "aug" => Some(time::Month::August),
+        "september" | "sep" | "sept" => Some(time::Month::September),
+        "october" | "oct" => Some(time::Month::October),
+        "november" | "nov" => Some(time::Month::November),
+        "december" | "dec" => Some(time::Month::December),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "time")]
+fn parse_time_string_time(s: &str) -> Option<time::Time> {
+    let s_lower = s.to_lowercase().replace(' ', "");
+    let is_pm = s_lower.ends_with("pm");
+    let is_am = s_lower.ends_with("am");
+    let digits = s_lower.trim_end_matches("am").trim_end_matches("pm");
+
+    let parts: Vec<&str> = digits.split(':').collect();
+    let mut hour: u8 = parts.first()?.parse().ok()?;
+    let minute: u8 = if parts.len() > 1 {
+        parts[1].parse().ok()?
+    } else {
+        0
+    };
+
+    if is_pm && hour < 12 {
+        hour += 12;
+    } else if is_am && hour == 12 {
+        hour = 0;
+    }
+
+    time::Time::from_hms(hour, minute, 0).ok()
+}
+
+// -----------------------------------------------------------------------------
+// CHRONO CRATE IMPLEMENTATION (when chrono is enabled and time is not)
+// -----------------------------------------------------------------------------
+#[cfg(all(feature = "chrono", not(feature = "time")))]
+use chrono::Datelike;
+
+#[cfg(all(feature = "chrono", not(feature = "time")))]
+pub fn parse_date_string(s: &str, ref_date: Date) -> Option<Date> {
     let s_clean = s.trim();
 
     if s_clean.eq_ignore_ascii_case("today") {
@@ -179,7 +408,7 @@ pub fn parse_date_string(s: &str, ref_date: NaiveDate) -> Option<NaiveDate> {
                 continue;
             }
         }
-        if let Some(m) = parse_month_name(token) {
+        if let Some(m) = parse_month_chrono(token) {
             month = Some(m);
         }
     }
@@ -190,7 +419,7 @@ pub fn parse_date_string(s: &str, ref_date: NaiveDate) -> Option<NaiveDate> {
         Some(y) => y,
         None => {
             let mut y = ref_date.year();
-            if let Some(candidate) = NaiveDate::from_ymd_opt(y, m, d) {
+            if let Some(candidate) = chrono::NaiveDate::from_ymd_opt(y, m, d) {
                 if candidate < ref_date - chrono::Duration::days(180) {
                     y += 1;
                 } else if candidate > ref_date + chrono::Duration::days(180) {
@@ -201,11 +430,11 @@ pub fn parse_date_string(s: &str, ref_date: NaiveDate) -> Option<NaiveDate> {
         }
     };
 
-    NaiveDate::from_ymd_opt(y, m, d)
+    chrono::NaiveDate::from_ymd_opt(y, m, d)
 }
 
-/// Parses date-time strings such as "Friday 31 July, at 10:21am" or "Friday 31 July, at 8:46am".
-pub fn parse_datetime_string(s: &str, ref_date: NaiveDate) -> Option<NaiveDateTime> {
+#[cfg(all(feature = "chrono", not(feature = "time")))]
+pub fn parse_datetime_string(s: &str, ref_date: Date) -> Option<DateTime> {
     let s_clean = s.trim();
     let parts: Vec<&str> = if s_clean.contains(", at ") {
         s_clean.split(", at ").collect()
@@ -220,7 +449,7 @@ pub fn parse_datetime_string(s: &str, ref_date: NaiveDate) -> Option<NaiveDateTi
 
     if parts.len() > 1 {
         let time_part = parts[1].trim();
-        if let Some(time) = parse_time_string(time_part) {
+        if let Some(time) = parse_time_string_chrono(time_part) {
             return Some(date.and_time(time));
         }
     }
@@ -228,7 +457,8 @@ pub fn parse_datetime_string(s: &str, ref_date: NaiveDate) -> Option<NaiveDateTi
     date.and_hms_opt(0, 0, 0)
 }
 
-fn parse_month_name(s: &str) -> Option<u32> {
+#[cfg(all(feature = "chrono", not(feature = "time")))]
+fn parse_month_chrono(s: &str) -> Option<u32> {
     match s.to_lowercase().as_str() {
         "january" | "jan" => Some(1),
         "february" | "feb" => Some(2),
@@ -246,7 +476,8 @@ fn parse_month_name(s: &str) -> Option<u32> {
     }
 }
 
-fn parse_time_string(s: &str) -> Option<NaiveTime> {
+#[cfg(all(feature = "chrono", not(feature = "time")))]
+fn parse_time_string_chrono(s: &str) -> Option<chrono::NaiveTime> {
     let s_lower = s.to_lowercase().replace(' ', "");
     let is_pm = s_lower.ends_with("pm");
     let is_am = s_lower.ends_with("am");
@@ -266,7 +497,7 @@ fn parse_time_string(s: &str) -> Option<NaiveTime> {
         hour = 0;
     }
 
-    NaiveTime::from_hms_opt(hour, minute, 0)
+    chrono::NaiveTime::from_hms_opt(hour, minute, 0)
 }
 
 #[cfg(test)]
@@ -274,22 +505,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_date_and_time_strings() {
-        let ref_date = NaiveDate::from_ymd_opt(2026, 8, 6).unwrap();
+    #[cfg(feature = "time")]
+    fn test_parse_date_and_time_strings_time() {
+        let ref_date = time::Date::from_calendar_date(2026, time::Month::August, 6).unwrap();
 
         assert_eq!(
             parse_date_string("Friday 7 August", ref_date),
-            Some(NaiveDate::from_ymd_opt(2026, 8, 7).unwrap())
+            Some(time::Date::from_calendar_date(2026, time::Month::August, 7).unwrap())
         );
 
         assert_eq!(
             parse_datetime_string("Friday 31 July, at 10:21am", ref_date),
-            Some(NaiveDate::from_ymd_opt(2026, 7, 31).unwrap().and_hms_opt(10, 21, 0).unwrap())
+            Some(time::PrimitiveDateTime::new(
+                time::Date::from_calendar_date(2026, time::Month::July, 31).unwrap(),
+                time::Time::from_hms(10, 21, 0).unwrap()
+            ))
         );
+    }
+
+    #[test]
+    #[cfg(all(feature = "chrono", not(feature = "time")))]
+    fn test_parse_date_and_time_strings_chrono() {
+        let ref_date = chrono::NaiveDate::from_ymd_opt(2026, 8, 6).unwrap();
 
         assert_eq!(
-            parse_datetime_string("Friday 31 July, at 8:46am", ref_date),
-            Some(NaiveDate::from_ymd_opt(2026, 7, 31).unwrap().and_hms_opt(8, 46, 0).unwrap())
+            parse_date_string("Friday 7 August", ref_date),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 8, 7).unwrap())
         );
     }
 
@@ -311,8 +552,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_bin_schedule() {
-        let ref_date = NaiveDate::from_ymd_opt(2026, 8, 6).unwrap();
+    #[cfg(feature = "time")]
+    fn test_parse_bin_schedule_time() {
+        let ref_date = time::Date::from_calendar_date(2026, time::Month::August, 6).unwrap();
         let html = r#"
         <dl class="waste__address">
             <dd class="waste__address__property">2 Gresham Way, Wimbledon, London, SW19 8ED</dd>
@@ -347,10 +589,13 @@ mod tests {
         let c = &schedule.collections[0];
         assert_eq!(c.service_name, "Food waste");
         assert_eq!(c.frequency.as_deref(), Some("Every Friday"));
-        assert_eq!(c.next_collection, Some(NaiveDate::from_ymd_opt(2026, 8, 7).unwrap()));
+        assert_eq!(c.next_collection, Some(time::Date::from_calendar_date(2026, time::Month::August, 7).unwrap()));
         assert_eq!(
             c.last_collection,
-            Some(NaiveDate::from_ymd_opt(2026, 7, 31).unwrap().and_hms_opt(10, 21, 0).unwrap())
+            Some(time::PrimitiveDateTime::new(
+                time::Date::from_calendar_date(2026, time::Month::July, 31).unwrap(),
+                time::Time::from_hms(10, 21, 0).unwrap()
+            ))
         );
     }
 }

@@ -1,7 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "time")]
+pub type Date = time::Date;
+
+#[cfg(feature = "time")]
+pub type DateTime = time::PrimitiveDateTime;
+
+#[cfg(all(feature = "chrono", not(feature = "time")))]
+pub type Date = chrono::NaiveDate;
+
+#[cfg(all(feature = "chrono", not(feature = "time")))]
+pub type DateTime = chrono::NaiveDateTime;
 
 /// Represents an address search result returned when looking up a postcode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,9 +31,11 @@ pub struct Collection {
     /// Collection frequency if available (e.g. "Every Friday", "Every other Friday")
     pub frequency: Option<String>,
     /// Next scheduled collection date
-    pub next_collection: Option<NaiveDate>,
+    #[cfg(any(feature = "time", feature = "chrono"))]
+    pub next_collection: Option<Date>,
     /// Last collection date and time
-    pub last_collection: Option<NaiveDateTime>,
+    #[cfg(any(feature = "time", feature = "chrono"))]
+    pub last_collection: Option<DateTime>,
     /// Additional info or notice if present
     pub info: Option<String>,
 }
